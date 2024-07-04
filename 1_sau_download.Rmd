@@ -1,0 +1,339 @@
+---
+title: "Analyzing SeaAroundUs Fishing Catch Composition in Large Marine Ecosystems (1950-2019)"
+subtitle: "Download and process data"
+date: "`r Sys.Date()`"
+author: Jorge Mestre Tomás
+output:
+  html_document:
+    toc: true
+    number_sections: true
+    toc_float: true
+    code_folding: hide
+    theme: united
+    highlight: tango
+    fig_width: 7
+    fig_height: 6
+    fig_caption: true
+    df_print: paged
+---
+
+
+```{r setup}
+# R Markdown setup
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+run_all <- FALSE
+
+# Custom functions
+# Function to get the Sea Around Us API base URL
+get_api_base_url <- function() {
+  return("https://api.seaaroundus.org/api/v1")
+}
+
+# Function to download Sea Around Us data
+get_sau_data <- function(
+  area = "lme",
+  measure = "tonnage",
+  dimension = "functionalgroup",
+  format = "csv",
+  limit = 10,
+  sciname = "false",
+  region_id = 1,
+  attempts = 10,
+  out_dir = "./"
+) {
+  # Construct the download URL based on input parameters
+  download_url <- paste0(
+    get_api_base_url(), "/", area, "/", measure, "/",
+    dimension, "/?format=", format, "&limit=", limit,
+    "&sciname=", sciname, "&region_id=", region_id
+  )
+  
+  # Construct the full output file path
+  out_file <- file.path(
+    out_dir,
+    paste0("sau_", area, "_", measure, "_", dimension, "_", region_id, ".zip")
+  )
+  
+  # Attempt to download the file with retry attempts
+  cur_attempt <- 1
+  while (!file.exists(out_file) & cur_attempt <= attempts) {
+    tryCatch(
+      download.file(download_url, destfile = out_file, mode = "wb"),
+      error = function(e) {
+        options(timeout = getOption("timeout") + 1000)  # Increase the timeout on error
+      }
+    )
+    cur_attempt <- cur_attempt + 1
+  }
+  
+  # Check if the file was successfully downloaded
+  if (!file.exists(out_file)) {
+    stop(paste("Error downloading data from the following URL:", download_url, "\n",
+               "Please check your input parameters and ensure that the Sea Around Us API is accessible."))
+  }
+}
+
+# Factor levels
+func_grp_lvls <- c("Pel_SmMd", "Dem_SmMd", "Pel_Lg", "Dem_Lg", 
+                   "Sharks_Rays", "Crusts", "Cephs", "Other")
+```
+
+# Data Download and Preprocessing
+
+## Required Packages
+
+Data was processed and analyzed using R Project and the following R packages (versions indicated for reproducibility):
+
+```{r packages, eval = run_all}
+library(sf) # version 1.0.14
+library(tidyverse) # version 2.0.0
+```
+
+## Data Source
+
+We obtained catch data from *Sea Around Us* (<https://www.seaaroundus.org/>) for the world's 66 Large Marine Ecosystems (LMEs). We selected data spanning seventy years (1950-2019), including reported data and reconstructed estimates. LMEs represent large oceanic regions near coastlines with generally higher primary productivity than open ocean areas. The catch data, classified into 30 functional groups, was measured in tonnes.
+
+```{r get_sau_data, eval = run_all}
+# Download Sea Around Us data
+area <- "lme"
+measure <- "tonnage"
+dimension <- "functionalgroup"
+format <- "csv"
+limit <- 10
+sciname <- "false"
+attempts <- 10
+out_dir <- "data/raw_data/sau_files"
+id_vector <- 1:66
+
+# Loop through each LME to get data
+for (id in id_vector){
+  get_sau_data(area, measure, dimension, format, limit, sciname, id, attempts, out_dir)
+}
+```
+
+Catch data (version 50.1) was retrieved using the Sea Around Us API. The data, available in CSV format, was downloaded, unzipped, and subsequently saved as an Rdata file.
+
+> **_NOTE:_** Central Arctic Ocean (ID 64) currently has no catches due to ice cover.
+
+```{r extract_sau_data, eval = run_all}
+# Specify the paths to zip files
+zip_files <- file.path(
+  out_dir,
+  paste0("sau_", area, "_", measure, "_", dimension, "_", id_vector, ".zip")
+)
+
+# Initialize an empty list to store dataframes
+data_list <- list()
+
+# Loop through each zip file
+for (i in 1:length(id_vector)) {
+  zip_file_path <- zip_files[i]
+
+  # Create a temporary directory for each zip file
+  temp_dir <- tempdir()
+  
+  # Unzip the file to the temporary directory
+  unzip(zipfile = zip_file_path, exdir = temp_dir)
+  
+  # List the files in the temporary directory
+  extracted_files <- list.files(temp_dir, full.names = TRUE)
+  
+  # Find the CSV file
+  csv_file <- extracted_files[grep("\\.csv$", extracted_files)]
+  
+  # Read the CSV file into a data frame
+  data <- tryCatch(
+    read.csv(csv_file, sep = ",", header = TRUE),
+    error = function(x) {
+      message(paste("LME ", i, "downloaded empty data"))
+      return(NULL)})
+  if (is.null(data)) {
+    unlink(temp_dir, recursive = TRUE)
+    next
+  }
+  
+  # Extract LME name
+  lme_name <- gsub(" ", "_", data[1,1])
+    
+  # Append the dataframe to the list
+  data_list[[lme_name]] <- data[, c("area_name", "year", "functional_group", "tonnes")]
+  data_list[[lme_name]]$area_id <- i
+
+  # Cleanup: Remove the temporary directory and its contents
+  unlink(temp_dir, recursive = TRUE)
+}
+
+# Combine dataframes into a single dataframe
+sau_original <- do.call(rbind, data_list)
+
+# Save the combined dataframe as an Rdata file
+save(sau_original, file = "data/raw_data/sau_original_classification.RData")
+```
+
+## Data Preprocessing
+
+We will not work with the Sea Around Us classification of 30 functional groups, but with a more compact classification consisting of 8 functional groups and encompassing the rest. The table below shows the mapping from the original Sea Around Us classification to our new classification. Subsequently, the catch data was aggregated for each functional group in each LME and year.
+
+| **New Classification** | **Sea Around Us Classification**                     |
+| ---------------------------------- | ------------------------------------- |
+| Pelagics (small and medium) |  Medium bathypelagics (30 - 89 cm)  |
+|                                       |  Medium benthopelagics (30 - 89 cm) |
+|                                       |  Medium pelagics (30 - 89 cm)       |
+|                                       |  Small bathypelagics (<30 cm)       |
+|                                       |  Small benthopelagics (<30 cm)      |
+|                                       |  Small pelagics (<30 cm)            |
+| Demersals (small and medium) |  Medium bathydemersals (30 - 89 cm) |
+|                                         |  Medium demersals (30 - 89 cm)      |
+|                                         |  Medium reef assoc. fish (30 - 89 cm) |
+|                                         |  Small bathydemersals (<30 cm)      |
+|                                         |  Small demersals (<30 cm)           |
+|                                         |  Small reef assoc. fish (<30 cm)    |
+|                                         |  Small to medium flatfishes (<90 cm) |
+| Large pelagics             |  Large bathypelagics (>=90 cm)      |
+|                                       |  Large benthopelagics (>=90 cm)    |
+|                                       |  Large pelagics (>=90 cm)           |
+| Large demersals            |  Large bathydemersals (>=90 cm)     |
+|                                       |  Large demersals (>=90 cm)          |
+|                                       |  Large flatfishes (>=90 cm)        |
+|                                       |  Large reef assoc. fish (>=90 cm)  |
+| Sharks and rays       |  Large rays (>=90 cm)               |
+|                                       |  Large sharks (>=90 cm)             |
+|                                       |  Small to medium rays (<90 cm)     |
+|                                       |  Small to medium sharks (<90 cm)   |
+| Crustaceans                |  Krill                              |
+|                                       |  Lobsters, crabs                    |
+|                                       |  Shrimps                            |
+| Cephalopods                 |  Cephalopods                        |
+| Other                              |  Jellyfish                          |
+|                                       |  Other demersal invertebrates       |
+
+
+```{r update_functional_groups, eval = run_all}
+# Use our functional group classification
+category_matches <- c(
+  "Medium bathypelagics (30 - 89 cm)" = "Pel_SmMd",
+  "Medium benthopelagics (30 - 89 cm)" = "Pel_SmMd",
+  "Medium pelagics (30 - 89 cm)" = "Pel_SmMd",
+  "Small bathypelagics (<30 cm)" = "Pel_SmMd",
+  "Small benthopelagics (<30 cm)" = "Pel_SmMd",
+  "Small pelagics (<30 cm)" = "Pel_SmMd",
+
+  "Medium bathydemersals (30 - 89 cm)" = "Dem_SmMd",
+  "Medium demersals (30 - 89 cm)" = "Dem_SmMd",
+  "Medium reef assoc. fish (30 - 89 cm)" = "Dem_SmMd",
+  "Small bathydemersals (<30 cm)" = "Dem_SmMd",
+  "Small demersals (<30 cm)" = "Dem_SmMd",
+  "Small reef assoc. fish (<30 cm)" = "Dem_SmMd",
+  "Small to medium flatfishes (<90 cm)" = "Dem_SmMd",
+
+  "Large bathypelagics (>=90 cm)" = "Pel_Lg",
+  "Large benthopelagics (>=90 cm)" = "Pel_Lg",
+  "Large pelagics (>=90 cm)" = "Pel_Lg",
+
+  "Large bathydemersals (>=90 cm)" = "Dem_Lg",
+  "Large demersals (>=90 cm)" = "Dem_Lg",
+  "Large flatfishes (>=90 cm)" = "Dem_Lg",
+  "Large reef assoc. fish (>=90 cm)" = "Dem_Lg",
+
+  "Large rays (>=90 cm)" = "Sharks_Rays",
+  "Large sharks (>=90 cm)" = "Sharks_Rays",
+  "Small to medium rays (<90 cm)" = "Sharks_Rays",
+  "Small to medium sharks (<90 cm)" = "Sharks_Rays",
+
+  "Krill" = "Crusts",
+  "Lobsters, crabs" = "Crusts",
+  "Shrimps" = "Crusts",
+
+  "Cephalopods" = "Cephs",
+
+  "Jellyfish" = "Other",
+  "Other demersal invertebrates" = "Other"
+)
+
+# Update categories and aggregate values
+sau_update <- sau_original
+match_names <- match(sau_update$functional_group, names(category_matches))
+sau_update$functional_group <- category_matches[match_names]
+sau_update <- sau_update %>% 
+  group_by(area_id, area_name, year, functional_group) %>% 
+  summarise(tonnes = sum(tonnes))
+```
+
+Since we are interested in the temporal and spatial variation of catch composition, we will be working with relative values and compositional data. Compositional data is a type of multivariate data where the portions of the observational vector are non-negative and sum up to a constant. A composition is a vector of $D$ non-negative components $\mathbf{x} = [x_i,...,x_D]$ summing up to a given constant $k$. Then the $D$-part simplex $S^D$ is defined as 
+
+$$
+S^D = \Bigl\{ \mathbf{x} = (x_1,...,x_D)' \in R^D | x_i > 0, \sum^D_{i=1} x_i = k \Bigl\}.
+$$
+
+In order for all compositions to sum up to the same constant, we applied the closure operation to normalize them to $k = 1$,
+
+$$
+C_k(\mathbf{x}) = \left( \frac{k \cdot x_1}{\sum^D_{i=1} x_i}, ...,  \frac{k \cdot x_D}{\sum^D_{i=1} x_i}\right).
+$$
+This leads to a composition $\mathbf{x}$ with the same number of elements but the vector sum up to 1.
+
+```{r closure_composition, eval = run_all}
+# Closure operation
+sau_update <- sau_update %>% 
+  group_by(area_id, area_name, year) %>% 
+  mutate(comp = tonnes / sum(tonnes)) %>% 
+  as.data.frame()
+
+save(sau_update, file = "data/raw_data/sau_update_classification.RData")
+```
+
+Complete missing values with 0 (essential zeros).
+
+```{r load_compostion, eval = run_all}
+# Load data set
+load("data/raw_data/sau_update_classification.RData")
+load("data/clean_data/lme_name_to_id.RData")
+
+sau_update <- sau_update %>% 
+  select(!c(area_name)) %>%
+  complete(area_id = 1:66, year, functional_group, fill = list(comp = 0)) %>% 
+  left_join(lme_name_to_id, by = "area_id")
+sau_update$functional_group <- factor(sau_update$functional_group, levels = func_grp_lvls)
+```
+
+# LME polygons processing
+
+We will also load the polygons with the LMEs and compute their centroids for ploting.
+
+```{r lme_polygons_load, results='hide', eval = run_all}
+# Get LME polygons
+lme_geom <- st_read("data/raw_data/polygons/lme66.kml") %>% 
+  select(c(Name, geometry))
+
+# Get LME centroids
+x_centroids <- c()
+y_centroids <- c()
+for (i in 1:66){
+  tmp_cent <- lme_geom[i, ] %>% 
+    st_make_valid() %>% 
+    st_centroid() %>%
+    st_geometry() 
+    #st_transform(st_crs("+proj=moll"))
+  
+  x_centroids <- c(x_centroids, tmp_cent[[1]][1])
+  y_centroids <- c(y_centroids, tmp_cent[[1]][2])
+  
+}
+lme_geom$x <- x_centroids
+lme_geom$y <- y_centroids
+lme_geom <- st_wrap_dateline(lme_geom)
+  #st_transform(st_crs("+proj=moll"))
+
+lme_geom <- left_join(lme_geom, lme_name_to_id, by = join_by(Name == name_sf))
+lme_geom$area_id <- factor(lme_geom$area_id, levels = 1:66)
+lme_geom <- sf::st_zm(lme_geom)
+```
+
+# Save clean data and polygons
+
+```{r, eval = run_all}
+lme_comp <- sau_update
+write.table(lme_comp, file = "data/clean_data/lme_comp.csv", sep =  "\t", dec = ".", quote = FALSE, col.names = TRUE, row.names = FALSE)
+sf::st_write(lme_geom, "data/clean_data/lme_geom.shp")
+```
+

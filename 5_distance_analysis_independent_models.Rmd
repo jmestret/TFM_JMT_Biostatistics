@@ -1,0 +1,358 @@
+---
+title: "Analyzing SeaAroundUs Fishing Catch Composition in Large Marine Ecosystems (1950-2019)"
+subtitle: "Distance analysis pre-smoothing with independent models for each LME"
+date: "`r Sys.Date()`"
+author: Jorge Mestre Tomás
+institution: Universitat de València
+output:
+  html_document:
+    toc: true
+    number_sections: false
+    toc_float: false
+    code_folding: show
+    theme: united
+    highlight: tango
+    fig_width: 7
+    fig_height: 6
+    fig_caption: true
+    df_print: paged
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r setup, include=FALSE}
+# R Markdown setup
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# Theme and colors
+blue2purple <- c("#80FFDB", "#36E9E5", "#00D2F0", "#00B8FA", 
+                 "#009BFD", "#007BFB", "#4F51E2", "#7400B8")
+
+qual_palette <- c("#F29F05", "#F2CB05","#45D089", "#D0F2EC", "#7EA5D9", "#F20587", "#7A1694", "#F24405")
+
+# Factor levels
+func_grp_lvls <- c("Pel_SmMd", "Dem_SmMd", "Pel_Lg", "Dem_Lg", 
+                   "Sharks_Rays", "Crusts", "Cephs", "Other")
+func_grp_colors <- c("#66c2a5", "#fc8d62","#8da0cb", "#e78ac3", "#a6d854", "#ffd92f", "#e5c494", "#b3b3b3")
+names(func_grp_colors) <- func_grp_lvls
+```
+
+# Load packages
+
+```{r packages}
+# Load libraries
+library(compositions)
+library(sf)
+library(ggpubr)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(DirichletReg)
+library(forecast)
+library(lmtest)
+library(vars)
+library(tidyverse)
+library(INLA)
+library(INLAcomp)
+```
+
+```{r}
+# Set seed
+set.seed(230424)
+inla.seed <- sample.int(n = 1E6, size = 1)
+```
+
+# Data loading
+
+Load compositional data.
+
+```{r load_compostion}
+# Load compositional data and LME polygons
+lme_comp <- read.table("data/clean_data/lme_comp.csv", header = TRUE, sep = "\t", dec = ".") %>% 
+  dplyr::select(!tonnes)
+```
+
+Select LMEs with no zero values.
+
+```{r}
+area_id_with_zero <- unique(lme_comp[lme_comp$comp == 0, "area_id"])
+lme_no_zero <- lme_comp[!(lme_comp$area_id %in% area_id_with_zero), ]
+```
+
+As data is very noisy we want to extract the trend or smooth the time series before doing clustering. We can achive this by fitting a model to each LME and compute the fitted values. In this example we will work with the Pacific Central-American Coastal as an example:
+
+
+```{r}
+coda_inla_stack <- function(alry, k, N) {
+  names_alry <- colnames(alry)
+  
+  # Include time
+  alry$time <- 1:nrow(alry)
+  
+  # Extend the dataset of the alr-coordinates to fit in the inla.stack
+  data_ext <- alry %>%
+    tidyr::pivot_longer(., cols = names_alry,
+                        names_to = "alr_names",
+                        values_to = "alr_resp") %>%
+    .[order(ordered(.$alr_names)),]
+  data_ext$alr_names <- ordered(data_ext$alr_names)
+  
+  # Define index for each alr-coordinate
+  k_group <- data_ext$alr_names %>% as.numeric() #For group
+  k_repl  <- data_ext$alr_names %>% as.numeric() #For replication
+  
+  # Index for the temporal effects
+  iset <- inla.spde.make.index('i', n.spde = nrow(alry),
+                               n.repl  = k-1) #Replicating temporal effect
+  
+  # iset for copy
+  iset2 <- inla.spde.make.index('i', n.spde = nrow(alry))
+  iset_aux <- matrix(NA, ncol = k-1, nrow = k-1)
+  diag(iset_aux) <- rep(1, k-1)
+  iset2 <- kronecker(iset_aux, iset2$i)
+  colnames(iset2) <- names_alry
+  
+  # Define the part to the shared random effect
+  # Index for the random effect that is going to give the correlation
+  id_z <- rep(1:(dim(data_ext)[1]/(k-1)), k-1)
+  
+  # Index for indicating the alr-coordinate
+  id_cat <- rep(1:(k-1), rep(N, k-1))
+  
+  # Response variable in R-INLA
+  1:length(names_alry) %>%
+    lapply(., function(i){
+      data_ext %>%
+        dplyr::filter(alr_names == names_alry[i]) -> data_comp_i
+      #Response
+      y_alr <- matrix(ncol = names_alry %>% length(.), nrow = dim(data_comp_i)[1])
+      y_alr[, i] <- data_comp_i$alr_resp
+    }) -> alr_resp
+  
+  1:length(names_alry) %>%
+    lapply(., function(i){
+      y_aux <- data_ext %>%
+        dplyr::select(alr_resp, alr_names) %>%
+        dplyr::filter(alr_names == names_alry[i]) %>%
+        dplyr::select(alr_resp) %>%
+        as.matrix(.)
+      aux_vec <- rep(NA, (D-1))
+      aux_vec[i] <- 1
+      kronecker(aux_vec, y_aux)
+    }) -> y_list
+  
+  y_alr <- do.call(cbind, y_list)
+  y_alr[c(1, 71, 141, 211, 291, 361, 421), ]
+  
+  # Covariates are included in the model as random effects with big variances.
+  variables <- c("intercept", "time")
+  id_names <- paste0("id_", variables)
+  id_variables <- rep(id_cat, length(variables)) %>% 
+    matrix(., ncol = length(variables), byrow = FALSE)
+  colnames(id_variables) <- id_names
+  
+  # Build stack
+  stk_est <- inla.stack(
+    data    = list(resp = y_alr),
+    A       = list(1, 1, 1),
+    effects = list(c(iset),
+                   cbind(data_ext %>% dplyr::select(time),
+                         
+                         id_z,
+                         id_variables, 
+                         intercept = 1),
+                   data.frame(iset2)
+    ),
+    tag     = 'est'
+  )
+  
+  return(stk_est)
+}
+```
+
+```{r}
+fitted_compositions <- list()
+for (i in unique(lme_no_zero$area_id)){
+  # Select one LME
+  single_lme <- lme_no_zero[lme_no_zero$area_id == i, ] %>% 
+    pivot_wider(names_from = functional_group, values_from = comp) %>% 
+    as.data.frame()
+  
+  # Composition
+  y <- compositions::acomp(single_lme[, func_grp_lvls]) %>% 
+    as.data.frame()
+  
+  # Transformation to *alr*-coordinates
+  y <- y[,c(func_grp_lvls[func_grp_lvls != "Pel_SmMd"], "Pel_SmMd")]
+  alry <- compositions::alr(y) %>% as.data.frame()
+  
+  # Prepare variables
+  D <- k <- ncol(y)
+  N <- nrow(y)
+  
+  # Create INLA stack
+  stk_est <- coda_inla_stack(alry, k, N)
+  
+  # Fit model
+  list_prior <- rep(list(list(prior = "pc.prec", param = c(1, 0.01))), D-1)
+  
+  formula_model <- resp ~ -1 +
+    f(id_intercept, intercept,
+      model = "iid",
+      initial = log(1/1000),
+      fixed = TRUE) +
+    f(i,
+      model = "rw2",
+      replicate = i.repl) +
+    f(id_z,
+      model = "iid",
+      hyper = list(prec = list(prior = "pc.prec",
+                               param = c(1, 0.01))), constr = TRUE)
+  
+  model <- inla(
+    formula_model,
+    family = rep("gaussian", D - 1),
+    data = inla.stack.data(stk_est),
+    control.compute = list(config = TRUE, 
+                           dic = TRUE,
+                           waic = TRUE,
+                           cpo = TRUE),
+    control.predictor = list(A = inla.stack.A(stk_est), 
+                             compute = TRUE),
+    control.family = list_prior,   
+    verbose = FALSE
+  )
+  
+  # Get fitted values composition
+  pred <- model$summary.fitted.values$mean[1:(N*(D-1))] %>% 
+    matrix(., ncol = D - 1, byrow = FALSE)
+  pred <- compositions::alrInv(pred)
+  colnames(pred) <- colnames(y)
+  
+  pred <- as.data.frame(pred)
+  pred$area_id <- i
+  pred$year <- 1950:2019
+  
+  fitted_compositions[[i]] <- pred
+}
+fitted_compositions <- do.call(rbind, fitted_compositions)
+```
+
+```{r}
+# Compute distance by year
+dist_matrix <- lapply(1950:2019, function(i){
+  a <- acomp(fitted_compositions[fitted_compositions$year == i, func_grp_lvls])
+  rownames(a) <- unique(lme_no_zero$area_id)
+  d <- dist(a)
+  return(as.matrix(d))
+})
+
+mean_dist_fitted <- sapply(dist_matrix, mean)
+
+mean_dist_by_lme_fitted <- lapply(dist_matrix, function(d) {
+  rowMeans(d, na.rm = TRUE)
+})
+
+mean_dist_by_lme_fitted <- do.call(cbind, mean_dist_by_lme_fitted) %>% 
+  as.data.frame() %>% 
+  rename_all(~as.character(1950:2019)) %>% 
+  rownames_to_column(var = "area_id") %>% 
+  pivot_longer(!area_id, names_to = "year", values_to = "mean_dist")
+
+plot(1950:2019, mean_dist_fitted)
+```
+
+```{r}
+ggplot(mean_dist_by_lme_fitted, aes(x = year, y = mean_dist, group = area_id, color = area_id)) +
+  geom_line() +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  ylab("mean distance") 
+```
+
+```{r}
+ggplot(mean_dist_by_lme_fitted[!(mean_dist_by_lme_fitted$area_id %in% c(65, 60, 10, 1, 5, 48)), ], aes(x = year, y = mean_dist, group = area_id, color = area_id)) +
+  geom_line() +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  ylab("mean distance") 
+```
+
+```{r}
+mean_dist_by_lme_fitted %>% 
+  group_by(year) %>% 
+  summarise(mean_dist = mean(mean_dist)) %>% 
+  mutate(year = as.numeric(year)) %>% 
+ggplot() +
+  geom_line(aes(x = year, y = mean_dist)) +
+  theme_minimal() +
+  ylab("mean distance") 
+```
+
+# Raw data
+
+```{r}
+# Compute distance by year
+raw_composition <- lme_no_zero %>% 
+    as.data.frame() %>% 
+    pivot_wider(names_from = functional_group, values_from = comp, values_fill = 0)
+dist_matrix <- lapply(1950:2019, function(i){
+  dist(acomp(raw_composition[raw_composition$year == i, func_grp_lvls]))
+})
+
+mean_dist_raw <- sapply(dist_matrix, mean)
+
+plot(1950:2019, mean_dist_raw)
+```
+
+```{r}
+data.frame(year = 1950:2019,
+           raw = mean_dist_raw,
+           fitted = mean_dist_fitted) %>% 
+  pivot_longer(!year, names_to = "type", values_to = "value") %>% 
+  ggplot() +
+  geom_line(aes(x = year, y = value, color = type)) +
+  geom_point(aes(x = year, y = value, color = type)) +
+  theme_minimal() +
+  ylab("mean distance")
+```
+
+
+```{r}
+p <- data.frame(year = 1950:2019,
+           fitted = mean_dist_fitted) %>% 
+  pivot_longer(!year, names_to = "type", values_to = "value") %>% 
+  ggplot() +
+  ggpattern::geom_ribbon_pattern(aes(x = year, ymin = 4, ymax = value),
+                               pattern = "gradient", 
+                               fill = "#00000000",
+                               pattern_fill  = "#00000000",
+                               pattern_fill2 = "#13426B80") +
+  geom_line(aes(x = year, y = value), color = "#13426B", size = 2) +
+  geom_point(aes(x = year, y = value), shape = 16, size = 2.5, colour = "#13426B") +
+  geom_point(aes(x = year, y = value), shape = 16, size = 0.5, colour = "white") +
+  geom_hline(aes(yintercept = 4), alpha = 0.02) +
+  theme_bw() +
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        panel.border       = element_blank(),
+        axis.line.x        = element_line(),
+        text               = element_text(size = 15),
+        plot.margin        = margin(unit(c(20, 20, 20, 20), "pt")),
+        axis.ticks         = element_blank(),
+        axis.text.y        = element_text(margin = margin(0,15,0,0, unit = "pt"))) +
+  scale_alpha_identity() +
+  scale_x_continuous(n.breaks = 10) +
+  scale_y_continuous(n.breaks = 10) +
+  ylab("Mean distance") +
+  xlab("") +
+  ggtitle("Fishing catch composition similarity") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+#ggsave("mean_dist_trend.pdf", p, height = 4, width = 6)
+#ggsave(filename = "../../../../poster_lmes/lmes_similarity.svg", height = 3, width = 6)
+print(p)
+```
+
+

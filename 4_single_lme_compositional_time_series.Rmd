@@ -1,0 +1,1171 @@
+---
+title: "Analyzing SeaAroundUs Fishing Catch Composition in Large Marine Ecosystems (1950-2019)"
+subtitle: "The Scotian Shelf LME"
+date: "`r Sys.Date()`"
+author: Jorge Mestre Tomás
+output:
+  html_document:
+    toc: true
+    number_sections: false
+    toc_float: false
+    code_folding: show
+    theme: united
+    highlight: tango
+    fig_width: 7
+    fig_height: 6
+    fig_caption: true
+    df_print: paged
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r setup, include=FALSE}
+# R Markdown setup
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# Theme and colors
+blue2purple <- c("#80FFDB", "#36E9E5", "#00D2F0", "#00B8FA", 
+                 "#009BFD", "#007BFB", "#4F51E2", "#7400B8")
+
+qual_palette <- c("#F29F05", "#F2CB05","#45D089", "#D0F2EC", "#7EA5D9", "#F20587", "#7A1694", "#F24405")
+
+# Factor levels
+func_grp_lvls <- c("Pel_SmMd", "Dem_SmMd", "Pel_Lg", "Dem_Lg", 
+                   "Sharks_Rays", "Crusts", "Cephs", "Other")
+func_grp_colors <- c("#66c2a5", "#fc8d62","#8da0cb", "#e78ac3", "#a6d854", "#ffd92f", "#e5c494", "#b3b3b3")
+names(func_grp_colors) <- func_grp_lvls
+```
+
+
+```{r packages}
+# Load libraries
+library(compositions)
+library(INLA)
+library(INLAcomp)
+library(tidyverse)
+```
+
+```{r}
+# Set seed
+set.seed(475908)
+inla.seed <- sample.int(n = 1E6, size = 1)
+```
+
+# Data loading
+
+Load compositional data.
+
+```{r load_compostion}
+single_lme <- read.table("data/clean_data/lme_comp.csv", header = TRUE, sep = "\t", dec = ".") %>% 
+  filter(area_id == 8) %>%
+  select(!tonnes) %>% 
+  pivot_wider(names_from = functional_group, values_from = comp)
+```
+```{r, echo = FALSE}
+p <- single_lme[, c(func_grp_lvls, "year")] %>% 
+  pivot_longer(!year, values_to = "comp", names_to = "functional_group") %>% 
+  mutate(functional_group = factor(functional_group, levels = func_grp_lvls)) %>% 
+  ggplot(aes(y = comp, x = year, fill = functional_group)) +
+  geom_area(color = "gray") +
+  scale_fill_manual(values = func_grp_colors, name = "Functional group") +
+  xlab("Year") +
+  ylab("Composition") +
+  theme_classic()
+
+#ggsave(filename = "img/scotian_shelf_time_series.pdf", p, height = 3.5, width = 7)
+print(p)
+```
+
+# Data preparation for fitting
+
+```{r}
+# Composition
+y <- acomp(single_lme[, func_grp_lvls]) %>% 
+  as.data.frame()
+head(y)
+```
+
+## Transformation to *alr*-coordinates
+
+We will choose as reference category for the `alr` transformation the one with lowest variance (one with low variability) and also that doesn't have a very small value.
+
+```{r}
+sort(apply(y, 2, function(x){var(log(x))}))
+sort(mean(acomp(y)), decreasing = T)
+```
+
+In this case we compute $alr$-coordinates using `Other` as reference category.
+ 
+```{r}
+y <- y[,c("Pel_SmMd", "Dem_SmMd", "Pel_Lg", "Dem_Lg", 
+          "Sharks_Rays", "Crusts", "Cephs", "Other")]
+data <- alr(y) %>% as.data.frame()
+head(data)
+```
+
+```{r}
+D <- k <- ncol(y)
+N <- nrow(y)
+names_y <- colnames(y)
+names_alry <- colnames(data)
+```
+
+## Include time
+
+Starting from 1.
+
+```{r}
+data$time <- 1:nrow(data)
+```
+```{r, echo = FALSE}
+p <- data %>%
+  tidyr::pivot_longer(., cols = names_alry,
+                      names_to = "alr_names", values_to = "alr_resp") %>%
+  ggplot(data = .) +
+  geom_line(aes(x = time, y = alr_resp), linewidth = 0.8) +
+  ylab("alr-coordinates") +
+  xlab("Time") +
+  facet_wrap(~alr_names) +
+  theme_classic() +
+  theme(legend.position = "bottom")
+
+#ggsave(filename = "img/scotian_shelf_alr_coords.pdf", p, height = 4, width = 7)
+print(p)
+```
+
+## Extending the dataset
+
+Extend the dataset of the $alr$-coordinates to fit in the `inla.stack`.
+
+```{r}
+data_ext <- data %>%
+  tidyr::pivot_longer(., cols = names_alry,
+                      names_to = "alr_names",
+                      values_to = "alr_resp") %>%
+  .[order(ordered(.$alr_names)),]
+data_ext$alr_names <- ordered(data_ext$alr_names)
+head(data_ext)
+```
+
+## Define index for each alr-coordinate
+
+```{r}
+k_group <- data_ext$alr_names %>% as.numeric() #For group
+k_repl  <- data_ext$alr_names %>% as.numeric() #For replication
+head(data.frame(k_group, k_repl))
+```
+
+## Index for the temporal effects
+
+```{r}
+iset <- inla.spde.make.index('i', n.spde = nrow(data),
+                             n.repl  = k-1) #Replicating temporal effect
+```
+
+### iset for copy
+
+```{r}
+iset2 <- inla.spde.make.index('i', n.spde = nrow(data))
+iset_aux <- matrix(NA, ncol = k-1, nrow = k-1)
+diag(iset_aux) <- rep(1, k-1)
+iset2 <- kronecker(iset_aux, iset2$i)
+colnames(iset2) <- names_alry
+```
+
+## Define the part to the shared random effect
+
+```{r}
+# Index for the random effect that is going to give the correlation
+id_z <- rep(1:(dim(data_ext)[1]/(k-1)), k-1)
+
+# Index for indicating the alr-coordinate
+id_cat <- rep(1:(k-1), rep(N, k-1))
+```
+
+## Response variable in R-INLA
+
+Matrix with dimmension $(N \times (D-1)) \times (D - 1)$ for including the multivariate response in R-INLA.
+
+```{r}
+1:length(names_alry) %>%
+  lapply(., function(i){
+    data_ext %>%
+      dplyr::filter(alr_names == names_alry[i]) -> data_comp_i
+    #Response
+    y_alr <- matrix(ncol = names_alry %>% length(.), nrow = dim(data_comp_i)[1])
+    y_alr[, i] <- data_comp_i$alr_resp
+  }) -> alr_resp
+
+1:length(names_alry) %>%
+  lapply(., function(i){
+    y_aux <- data_ext %>%
+      dplyr::select(alr_resp, alr_names) %>%
+      dplyr::filter(alr_names == names_alry[i]) %>%
+      dplyr::select(alr_resp) %>%
+      as.matrix(.)
+    aux_vec <- rep(NA, (D-1))
+    aux_vec[i] <- 1
+    kronecker(aux_vec, y_aux)
+  }) -> y_list
+
+y_alr <- do.call(cbind, y_list)
+y_alr[c(1, 71, 141, 211, 291, 361, 421), ]
+```
+
+## Covariates in R-INLA
+
+Covariates are included in the model as random effects with big variances.
+
+```{r}
+variables <- c("intercept", "time")
+id_names <- paste0("id_", variables)
+id_variables <- rep(id_cat, length(variables)) %>% 
+  matrix(., ncol = length(variables), byrow = FALSE)
+colnames(id_variables) <- id_names
+```
+
+## INLA stack for estimation
+
+```{r}
+stk_est <- inla.stack(
+  data    = list(resp = y_alr),
+  A       = list(1, 1, 1),
+  effects = list(c(iset),
+    cbind(data_ext %>% dplyr::select(time),
+          
+          id_z,
+          id_variables, 
+          intercept = 1),
+    data.frame(iset2)
+  ),
+  tag     = 'est'
+)
+```
+
+# Fitting the different models {.tabset .tabset-fade}
+
+## Model I {.tabset .tabset-fade}
+
+### Fitting the model
+
+Common parameters for the different categories and time as covariate.
+
+```{r}
+list_prior <- rep(list(list(prior = "pc.prec", param = c(1, 0.01))), D-1)
+
+formula_modelI <- resp ~ -1 +
+  intercept +
+  time +
+  f(id_z,
+    model = "iid",
+    hyper = list(prec = list(prior = "pc.prec",
+                             param = c(1, 0.01))), constr = TRUE)
+
+modelI <- inla(
+  formula_modelI,
+  family = rep("gaussian", D - 1),
+  data = inla.stack.data(stk_est),
+  control.compute = list(config = TRUE, 
+                         dic = TRUE,
+                         waic = TRUE,
+                         cpo = TRUE),
+  control.predictor = list(A = inla.stack.A(stk_est), 
+                           compute = TRUE),
+  control.family = list_prior,   
+  verbose = FALSE
+)
+```
+
+### Posterior distribution of the fixed effects
+
+```{r}
+data_betas <- rbind(
+  data.frame(inla.smarginal(modelI$marginals.fixed$intercept), var = "B0"),
+  data.frame(inla.smarginal(modelI$marginals.fixed$time), var = "B1")
+)
+
+ggplot() +
+  geom_line(data = data_betas, aes(x = x, y = y, col = var), linewidth = 0.9) +
+  facet_wrap(~var, scales = "free") +
+  theme_bw() +
+  theme(legend.position = "bottom") +
+  xlab(expression(beta)) +
+  ylab(expression(p(beta *'|'* theta))) +
+  theme(legend.title = element_blank())
+```
+
+### Posterior distribution of the hyperparameters
+
+```{r}
+prec <- list(sigma2.1 = modelI$marginals.hyperpar$`Precision for the Gaussian observations`,
+             sigma2.2 = modelI$marginals.hyperpar$`Precision for the Gaussian observations[2]`,
+             sigma2.3 = modelI$marginals.hyperpar$`Precision for the Gaussian observations[3]`,
+             sigma2.4 = modelI$marginals.hyperpar$`Precision for the Gaussian observations[4]`,
+             sigma2.5 = modelI$marginals.hyperpar$`Precision for the Gaussian observations[5]`,
+             sigma2.6 = modelI$marginals.hyperpar$`Precision for the Gaussian observations[6]`,
+             sigma2.7 = modelI$marginals.hyperpar$`Precision for the Gaussian observations[7]`,
+             gamma = modelI$marginals.hyper$`Precision for id_z`)
+
+hyper <- lapply(1:length(prec),
+                function(x){
+                  inla.smarginal(inla.tmarginal(prec[[x]], fun = function(y)(1/y))) %>%
+                    data.frame(.)
+                })
+names(hyper) <- names(prec)
+
+hyper.df <- lapply(1:length(hyper),
+                   function(x){
+                     cbind(data.frame(hyper[[x]]), name1 = names(hyper)[x])
+                   })  %>% 
+  do.call(rbind.data.frame, .)
+
+hyper.df$name1 <- ordered(hyper.df$name1,
+                          levels = c("sigma2.1", "sigma2.2", "sigma2.3", "sigma2.4", "sigma2.5", "sigma2.6", "sigma2.7",
+                                     "gamma"))
+
+hyper.df$name1 <- ordered(hyper.df$name1,
+                          levels = c("sigma2.1", "sigma2.2", "sigma2.3", "sigma2.4", "sigma2.5", "sigma2.6", "sigma2.7", "gamma"),
+                          labels = c("sigma[1]^2", "sigma[2]^2", "sigma[3]^2", "sigma[4]^2", "sigma[5]^2", "sigma[6]^2", "sigma[7]^2", "gamma"))
+
+ggplot(hyper.df) +
+  geom_line(aes(x = x, y = y)) +
+  facet_wrap(~ name1, scales = "free", labeller = label_parsed) +
+  theme_bw() +
+  xlab(expression(theta)) +
+  ylab(expression(p(theta*'|'*y)))
+```
+
+### Fitted values and residuals {.tabset .tabset-fade}
+
+#### alr-coordinates
+
+```{r}
+# Fitted values
+pred <- modelI$summary.fitted.values$mean[1:(N*(D-1))] %>% 
+  matrix(., ncol = D - 1, byrow = FALSE)
+
+# Residuals
+rsd <- data[, names_alry] - pred
+
+opar <- par(mfrow=c(2, 4),mar=c(2,2,1,1), oma=c(4,4,0,0))
+for(i in 1:7){
+  plot(pred[, i], rsd[, i], pch = 21, 
+    main = colnames(rsd)[i], xlab = "Fitted values on the simplex", ylab = "Residuals on the simplex", 
+    cex = 0.75, lwd = 0.5)
+  abline(h = 0, lty = 2)
+}
+mtext(text=c("Fitted values on the simplex","Residuals on the simplex"), side=c(1,2),at=0.5,line=2,outer=TRUE)
+par(opar)
+```
+
+#### Simplex
+
+```{r}
+pred <- compositions::alrInv(pred)
+colnames(pred) <- names_y
+rsd <- compositions::alrInv(rsd)
+colnames(rsd) <- names_y
+
+opar <- par(mfrow=c(2, 4),mar=c(2,2,1,1), oma=c(4,4,0,0))
+for(i in 1:8){
+  plot(pred[, i], rsd[, i], pch = 21, 
+    main = colnames(rsd)[i], xlab = "Fitted values on the simplex", ylab = "Residuals on the simplex", 
+    cex = 0.75, lwd = 0.5)
+  abline(h = 0, lty = 2)
+}
+mtext(text=c("Fitted values on the simplex","Residuals on the simplex"), side=c(1,2),at=0.5,line=2,outer=TRUE)
+par(opar)
+```
+
+## Model II {.tabset .tabset-fade}
+
+### Fitting the model
+
+Different parameters for each category and time as covariate.
+
+```{r}
+list_prior <- rep(list(list(prior = "pc.prec", param = c(1, 0.01))), D-1)
+
+formula_modelII <- resp ~ -1 +
+  f(id_intercept, intercept,
+    model = "iid",
+    initial = log(1/1000),
+    fixed = TRUE) +
+  f(id_time, time,
+    model = "iid",
+    initial = log(1/1000),
+    fixed = TRUE) +
+  f(id_z,
+    model = "iid",
+    hyper = list(prec = list(prior = "pc.prec",
+                             param = c(1, 0.01))), constr = TRUE)
+
+modelII <- inla(
+  formula_modelII,
+  family = rep("gaussian", D - 1),
+  data = inla.stack.data(stk_est),
+  control.compute = list(config = TRUE, 
+                         dic = TRUE,
+                         waic = TRUE,
+                         cpo = TRUE),
+  control.predictor = list(A = inla.stack.A(stk_est), 
+                           compute = TRUE),
+  control.family = list_prior,   
+  verbose = FALSE
+)
+```
+
+### Posterior distribution of the fixed effects
+
+```{r}
+data_beta0 <- rbind(
+  data.frame(inla.smarginal(modelII$marginals.random$id_intercept$index.1), alr = names_alry[1], var = "B0"),
+  data.frame(inla.smarginal(modelII$marginals.random$id_intercept$index.2), alr = names_alry[2], var = "B0"),
+  data.frame(inla.smarginal(modelII$marginals.random$id_intercept$index.3), alr = names_alry[3], var = "B0"),
+  data.frame(inla.smarginal(modelII$marginals.random$id_intercept$index.4), alr = names_alry[4], var = "B0"),
+  data.frame(inla.smarginal(modelII$marginals.random$id_intercept$index.5), alr = names_alry[5], var = "B0"),
+  data.frame(inla.smarginal(modelII$marginals.random$id_intercept$index.6), alr = names_alry[6], var = "B0"),
+  data.frame(inla.smarginal(modelII$marginals.random$id_intercept$index.7), alr = names_alry[7], var = "B0")
+)
+
+data_beta1 <- rbind(
+  data.frame(inla.smarginal(modelII$marginals.random$id_time$index.1), alr = names_alry[1], var = "B1"),
+  data.frame(inla.smarginal(modelII$marginals.random$id_time$index.2), alr = names_alry[2], var = "B1"),
+  data.frame(inla.smarginal(modelII$marginals.random$id_time$index.3), alr = names_alry[3], var = "B1"),
+  data.frame(inla.smarginal(modelII$marginals.random$id_time$index.4), alr = names_alry[4], var = "B1"),
+  data.frame(inla.smarginal(modelII$marginals.random$id_time$index.5), alr = names_alry[5], var = "B1"),
+  data.frame(inla.smarginal(modelII$marginals.random$id_time$index.6), alr = names_alry[6], var = "B1"),
+  data.frame(inla.smarginal(modelII$marginals.random$id_time$index.7), alr = names_alry[7], var = "B1")
+)
+
+ggplot() +
+  geom_line(data = data_beta0, aes(x = x, y = y, col = var), size = 0.9) +
+  facet_wrap(~alr, scales = "free") +
+  theme_bw() +
+  theme(legend.position = "bottom") +
+  xlab("B0") +
+  ylab(expression(p(beta *'|'* theta))) +
+  theme(legend.title = element_blank())
+
+ggplot() +
+  geom_line(data = data_beta1, aes(x = x, y = y, col = var), size = 0.9) +
+  facet_wrap(~alr, scales = "free") +
+  theme_bw() +
+  theme(legend.position = "bottom") +
+  xlab("B1") +
+  ylab(expression(p(beta *'|'* theta))) +
+  theme(legend.title = element_blank())
+```
+
+### Posterior distribution of the hyperparameters
+
+```{r}
+prec <- list(sigma2.1 = modelII$marginals.hyperpar$`Precision for the Gaussian observations`,
+             sigma2.2 = modelII$marginals.hyperpar$`Precision for the Gaussian observations[2]`,
+             sigma2.3 = modelII$marginals.hyperpar$`Precision for the Gaussian observations[3]`,
+             sigma2.4 = modelII$marginals.hyperpar$`Precision for the Gaussian observations[4]`,
+             sigma2.5 = modelII$marginals.hyperpar$`Precision for the Gaussian observations[5]`,
+             sigma2.6 = modelII$marginals.hyperpar$`Precision for the Gaussian observations[6]`,
+             sigma2.7 = modelII$marginals.hyperpar$`Precision for the Gaussian observations[7]`,
+             gamma = modelII$marginals.hyper$`Precision for id_z`)
+
+hyper <- lapply(1:length(prec),
+                function(x){
+                  inla.smarginal(inla.tmarginal(prec[[x]], fun = function(y)(1/y))) %>%
+                    data.frame(.)
+                })
+names(hyper) <- names(prec)
+
+hyper.df <- lapply(1:length(hyper),
+                   function(x){
+                     cbind(data.frame(hyper[[x]]), name1 = names(hyper)[x])
+                   })  %>% 
+  do.call(rbind.data.frame, .)
+
+hyper.df$name1 <- ordered(hyper.df$name1,
+                          levels = c("sigma2.1", "sigma2.2", "sigma2.3", "sigma2.4", "sigma2.5", "sigma2.6", "sigma2.7",
+                                     "gamma"))
+
+hyper.df$name1 <- ordered(hyper.df$name1,
+                          levels = c("sigma2.1", "sigma2.2", "sigma2.3", "sigma2.4", "sigma2.5", "sigma2.6", "sigma2.7", "gamma"),
+                          labels = c("sigma[1]^2", "sigma[2]^2", "sigma[3]^2", "sigma[4]^2", "sigma[5]^2", "sigma[6]^2", "sigma[7]^2", "gamma"))
+
+ggplot(hyper.df) +
+  geom_line(aes(x = x, y = y)) +
+  facet_wrap(~ name1, scales = "free", labeller = label_parsed) +
+  theme_bw() +
+  xlab(expression(theta)) +
+  ylab(expression(p(theta*'|'*y)))
+```
+
+### Fitted values and residuals {.tabset .tabset-fade}
+
+#### alr-coordinates
+
+```{r}
+# Fitted values
+pred <- modelII$summary.fitted.values$mean[1:(N*(D-1))] %>% 
+  matrix(., ncol = D - 1, byrow = FALSE)
+
+# Residuals
+rsd <- data[, names_alry] - pred
+
+opar <- par(mfrow=c(2, 4),mar=c(2,2,1,1), oma=c(4,4,0,0))
+for(i in 1:7){
+  plot(pred[, i], rsd[, i], pch = 21, 
+    main = colnames(rsd)[i], xlab = "Fitted values on the simplex", ylab = "Residuals on the simplex", 
+    cex = 0.75, lwd = 0.5)
+  abline(h = 0, lty = 2)
+}
+mtext(text=c("Fitted values on the simplex","Residuals on the simplex"), side=c(1,2),at=0.5,line=2,outer=TRUE)
+par(opar)
+```
+
+#### Simplex
+
+```{r}
+pred <- compositions::alrInv(pred)
+colnames(pred) <- names_y
+rsd <- compositions::alrInv(rsd)
+colnames(rsd) <- names_y
+
+opar <- par(mfrow=c(2, 4),mar=c(2,2,1,1), oma=c(4,4,0,0))
+for(i in 1:8){
+  plot(pred[, i], rsd[, i], pch = 21, 
+    main = colnames(rsd)[i], xlab = "Fitted values on the simplex", ylab = "Residuals on the simplex", 
+    cex = 0.75, lwd = 0.5)
+  abline(h = 0, lty = 2)
+}
+mtext(text=c("Fitted values on the simplex","Residuals on the simplex"), side=c(1,2),at=0.5,line=2,outer=TRUE)
+par(opar)
+```
+
+## Model III {.tabset .tabset-fade}
+
+### Fitting the model
+
+Different parameters for intercept and same temporal effect RW1.
+
+```{r}
+list_prior <- rep(list(list(prior = "pc.prec", param = c(1, 0.01))), D-1)
+
+formula_modelIII <- resp ~ -1 +
+  f(id_intercept, intercept,
+    model = "iid",
+    initial = log(1/1000),
+    fixed = TRUE) +
+  f(Pel_SmMd, model = "rw1") +
+  f(Dem_SmMd, copy = "Pel_SmMd", 
+    fixed = TRUE) +
+  f(Pel_Lg, copy = "Pel_SmMd", 
+    fixed = TRUE) +
+  f(Dem_Lg, copy = "Pel_SmMd", 
+    fixed = TRUE) +
+  f(Sharks_Rays, copy = "Pel_SmMd", 
+    fixed = TRUE) +
+  f(Crusts, copy = "Pel_SmMd", 
+    fixed = TRUE) +
+  f(Cephs, copy = "Pel_SmMd", 
+    fixed = TRUE) +
+  f(id_z,
+    model = "iid",
+    hyper = list(prec = list(prior = "pc.prec",
+                             param = c(1, 0.01))), constr = TRUE)
+
+modelIII <- inla(
+  formula_modelIII,
+  family = rep("gaussian", D - 1),
+  data = inla.stack.data(stk_est),
+  control.compute = list(config = TRUE, 
+                         dic = TRUE,
+                         waic = TRUE,
+                         cpo = TRUE),
+  control.predictor = list(A = inla.stack.A(stk_est), 
+                           compute = TRUE),
+  control.family = list_prior,   
+  verbose = FALSE
+)
+```
+
+### Fitted values and residuals {.tabset .tabset-fade}
+
+#### alr-coordinates
+
+```{r}
+# Fitted values
+pred <- modelIII$summary.fitted.values$mean[1:(N*(D-1))] %>% 
+  matrix(., ncol = D - 1, byrow = FALSE)
+
+# Residuals
+rsd <- data[, names_alry] - pred
+
+opar <- par(mfrow=c(2, 4),mar=c(2,2,1,1), oma=c(4,4,0,0))
+for(i in 1:7){
+  plot(pred[, i], rsd[, i], pch = 21, 
+    main = colnames(rsd)[i], xlab = "Fitted values on the simplex", ylab = "Residuals on the simplex", 
+    cex = 0.75, lwd = 0.5)
+  abline(h = 0, lty = 2)
+}
+mtext(text=c("Fitted values on the simplex","Residuals on the simplex"), side=c(1,2),at=0.5,line=2,outer=TRUE)
+par(opar)
+```
+
+#### Simplex
+
+```{r}
+pred <- compositions::alrInv(pred)
+colnames(pred) <- names_y
+rsd <- compositions::alrInv(rsd)
+colnames(rsd) <- names_y
+
+opar <- par(mfrow=c(2, 4),mar=c(2,2,1,1), oma=c(4,4,0,0))
+for(i in 1:8){
+  plot(pred[, i], rsd[, i], pch = 21, 
+    main = colnames(rsd)[i], xlab = "Fitted values on the simplex", ylab = "Residuals on the simplex", 
+    cex = 0.75, lwd = 0.5)
+  abline(h = 0, lty = 2)
+}
+mtext(text=c("Fitted values on the simplex","Residuals on the simplex"), side=c(1,2),at=0.5,line=2,outer=TRUE)
+par(opar)
+```
+
+## Model IV {.tabset .tabset-fade}
+
+### Fitting the model
+
+Different parameters for fixed effects, and different realizations of the temporal effect for each linear predictor RW1.
+
+```{r}
+list_prior <- rep(list(list(prior = "pc.prec", param = c(1, 0.01))), D-1)
+
+formula_modelIV <- resp ~ -1 +
+  f(id_intercept, intercept,
+    model = "iid",
+    initial = log(1/1000),
+    fixed = TRUE) +
+  f(i,
+    model = "rw1",
+    replicate = i.repl) +
+  f(id_z,
+    model = "iid",
+    hyper = list(prec = list(prior = "pc.prec",
+                             param = c(1, 0.01))), constr = TRUE)
+
+modelIV <- inla(
+  formula_modelIV,
+  family = rep("gaussian", D - 1),
+  data = inla.stack.data(stk_est),
+  control.compute = list(config = TRUE, 
+                         dic = TRUE,
+                         waic = TRUE,
+                         cpo = TRUE),
+  control.predictor = list(A = inla.stack.A(stk_est), 
+                           compute = TRUE),
+  control.family = list_prior,   
+  verbose = FALSE
+)
+```
+
+### Fitted values and residuals {.tabset .tabset-fade}
+
+#### alr-coordinates
+
+```{r}
+# Fitted values
+pred <- modelIV$summary.fitted.values$mean[1:(N*(D-1))] %>% 
+  matrix(., ncol = D - 1, byrow = FALSE)
+
+# Residuals
+rsd <- data[, names_alry] - pred
+
+opar <- par(mfrow=c(2, 4),mar=c(2,2,1,1), oma=c(4,4,0,0))
+for(i in 1:7){
+  plot(pred[, i], rsd[, i], pch = 21, 
+    main = colnames(rsd)[i], xlab = "Fitted values on the simplex", ylab = "Residuals on the simplex", 
+    cex = 0.75, lwd = 0.5)
+  abline(h = 0, lty = 2)
+}
+mtext(text=c("Fitted values on the simplex","Residuals on the simplex"), side=c(1,2),at=0.5,line=2,outer=TRUE)
+par(opar)
+```
+
+#### Simplex
+
+```{r}
+pred <- compositions::alrInv(pred)
+colnames(pred) <- names_y
+rsd <- compositions::alrInv(rsd)
+colnames(rsd) <- names_y
+
+opar <- par(mfrow=c(2, 4),mar=c(2,2,1,1), oma=c(4,4,0,0))
+for(i in 1:8){
+  plot(pred[, i], rsd[, i], pch = 21, 
+    main = colnames(rsd)[i], xlab = "Fitted values on the simplex", ylab = "Residuals on the simplex", 
+    cex = 0.75, lwd = 0.5)
+  abline(h = 0, lty = 2)
+}
+mtext(text=c("Fitted values on the simplex","Residuals on the simplex"), side=c(1,2),at=0.5,line=2,outer=TRUE)
+par(opar)
+```
+
+## Model V {.tabset .tabset-fade}
+
+### Fitting the model
+
+Different parameters for intercept and same temporal effect AR(1).
+
+```{r}
+list_prior <- rep(list(list(prior = "pc.prec", param = c(1, 0.01))), D-1)
+
+formula_modelV <- resp ~ -1 +
+  f(id_intercept, intercept,
+    model = "iid",
+    initial = log(1/1000),
+    fixed = TRUE) +
+  f(Pel_SmMd, model = "ar1") +
+  f(Dem_SmMd, copy = "Pel_SmMd", 
+    fixed = TRUE) +
+  f(Pel_Lg, copy = "Pel_SmMd", 
+    fixed = TRUE) +
+  f(Dem_Lg, copy = "Pel_SmMd", 
+    fixed = TRUE) +
+  f(Sharks_Rays, copy = "Pel_SmMd", 
+    fixed = TRUE) +
+  f(Crusts, copy = "Pel_SmMd", 
+    fixed = TRUE) +
+  f(Cephs, copy = "Pel_SmMd", 
+    fixed = TRUE) +
+  f(id_z,
+    model = "iid",
+    hyper = list(prec = list(prior = "pc.prec",
+                             param = c(1, 0.01))), constr = TRUE)
+
+modelV <- inla(
+  formula_modelV,
+  family = rep("gaussian", D - 1),
+  data = inla.stack.data(stk_est),
+  control.compute = list(config = TRUE, 
+                         dic = TRUE,
+                         waic = TRUE,
+                         cpo = TRUE),
+  control.predictor = list(A = inla.stack.A(stk_est), 
+                           compute = TRUE),
+  control.family = list_prior,   
+  verbose = FALSE
+)
+```
+
+### Fitted values and residuals {.tabset .tabset-fade}
+
+#### alr-coordinates
+
+```{r}
+# Fitted values
+pred <- modelV$summary.fitted.values$mean[1:(N*(D-1))] %>% 
+  matrix(., ncol = D - 1, byrow = FALSE)
+
+# Residuals
+rsd <- data[, names_alry] - pred
+
+opar <- par(mfrow=c(2, 4),mar=c(2,2,1,1), oma=c(4,4,0,0))
+for(i in 1:7){
+  plot(pred[, i], rsd[, i], pch = 21, 
+    main = colnames(rsd)[i], xlab = "Fitted values on the simplex", ylab = "Residuals on the simplex", 
+    cex = 0.75, lwd = 0.5)
+  abline(h = 0, lty = 2)
+}
+mtext(text=c("Fitted values on the simplex","Residuals on the simplex"), side=c(1,2),at=0.5,line=2,outer=TRUE)
+par(opar)
+```
+
+#### Simplex
+
+```{r}
+pred <- compositions::alrInv(pred)
+colnames(pred) <- names_y
+rsd <- compositions::alrInv(rsd)
+colnames(rsd) <- names_y
+
+opar <- par(mfrow=c(2, 4),mar=c(2,2,1,1), oma=c(4,4,0,0))
+for(i in 1:8){
+  plot(pred[, i], rsd[, i], pch = 21, 
+    main = colnames(rsd)[i], xlab = "Fitted values on the simplex", ylab = "Residuals on the simplex", 
+    cex = 0.75, lwd = 0.5)
+  abline(h = 0, lty = 2)
+}
+mtext(text=c("Fitted values on the simplex","Residuals on the simplex"), side=c(1,2),at=0.5,line=2,outer=TRUE)
+par(opar)
+```
+
+## Model VI {.tabset .tabset-fade}
+
+### Fitting the model
+
+Have different parameters for fixed effects, and different realizations of the temporal effect for each linear predictor AR(1).
+
+```{r}
+list_prior <- rep(list(list(prior = "pc.prec", param = c(1, 0.01))), D-1)
+
+formula_modelVI <- resp ~ -1 +
+  f(id_intercept, intercept,
+    model = "iid",
+    initial = log(1/1000),
+    fixed = TRUE) +
+  f(i,
+    model = "ar1",
+    replicate = i.repl) +
+  f(id_z,
+    model = "iid",
+    hyper = list(prec = list(prior = "pc.prec",
+                             param = c(1, 0.01))), constr = TRUE)
+
+modelVI <- inla(
+  formula_modelVI,
+  family = rep("gaussian", D - 1),
+  data = inla.stack.data(stk_est),
+  control.compute = list(config = TRUE, 
+                         dic = TRUE,
+                         waic = TRUE,
+                         cpo = TRUE),
+  control.predictor = list(A = inla.stack.A(stk_est), 
+                           compute = TRUE),
+  control.family = list_prior,   
+  verbose = FALSE
+)
+```
+
+### Fitted values and residuals {.tabset .tabset-fade}
+
+#### alr-coordinates
+
+```{r}
+# Fitted values
+pred <- modelVI$summary.fitted.values$mean[1:(N*(D-1))] %>% 
+  matrix(., ncol = D - 1, byrow = FALSE)
+
+# Residuals
+rsd <- data[, names_alry] - pred
+
+opar <- par(mfrow=c(2, 4),mar=c(2,2,1,1), oma=c(4,4,0,0))
+for(i in 1:7){
+  plot(pred[, i], rsd[, i], pch = 21, 
+    main = colnames(rsd)[i], xlab = "Fitted values on the simplex", ylab = "Residuals on the simplex", 
+    cex = 0.75, lwd = 0.5)
+  abline(h = 0, lty = 2)
+}
+mtext(text=c("Fitted values on the simplex","Residuals on the simplex"), side=c(1,2),at=0.5,line=2,outer=TRUE)
+par(opar)
+```
+
+#### Simplex
+
+```{r}
+pred <- compositions::alrInv(pred)
+colnames(pred) <- names_y
+rsd <- compositions::alrInv(rsd)
+colnames(rsd) <- names_y
+
+opar <- par(mfrow=c(2, 4),mar=c(2,2,1,1), oma=c(4,4,0,0))
+for(i in 1:8){
+  plot(pred[, i], rsd[, i], pch = 21, 
+    main = colnames(rsd)[i], xlab = "Fitted values on the simplex", ylab = "Residuals on the simplex", 
+    cex = 0.75, lwd = 0.5)
+  abline(h = 0, lty = 2)
+}
+mtext(text=c("Fitted values on the simplex","Residuals on the simplex"), side=c(1,2),at=0.5,line=2,outer=TRUE)
+par(opar)
+```
+
+## Model VII {.tabset .tabset-fade}
+
+### Fitting the model
+
+Have different parameters for fixed effects, and different realizations of the temporal effect for each linear predictor RW1.
+
+```{r}
+list_prior <- rep(list(list(prior = "pc.prec", param = c(1, 0.01))), D-1)
+
+formula_modelVII <- resp ~ -1 +
+  f(id_intercept, intercept,
+    model = "iid",
+    initial = log(1/1000),
+    fixed = TRUE) +
+  f(i,
+    model = "rw2",
+    replicate = i.repl) +
+  f(id_z,
+    model = "iid",
+    hyper = list(prec = list(prior = "pc.prec",
+                             param = c(1, 0.01))), constr = TRUE)
+
+modelVII <- inla(
+  formula_modelVII,
+  family = rep("gaussian", D - 1),
+  data = inla.stack.data(stk_est),
+  control.compute = list(config = TRUE, 
+                         dic = TRUE,
+                         waic = TRUE,
+                         cpo = TRUE),
+  control.predictor = list(A = inla.stack.A(stk_est), 
+                           compute = TRUE),
+  control.family = list_prior,   
+  verbose = FALSE
+)
+```
+
+### Fitted values and residuals {.tabset .tabset-fade}
+
+#### alr-coordinates
+
+```{r}
+# Fitted values
+pred <- modelVII$summary.fitted.values$mean[1:(N*(D-1))] %>% 
+  matrix(., ncol = D - 1, byrow = FALSE)
+
+# Residuals
+rsd <- data[, names_alry] - pred
+
+#pdf(file = "alr_residuals_RW2_scotian_shelf.pdf", width = 7, height = 4)
+opar <- par(mfrow=c(2, 4),mar=c(2,2,1,1), oma=c(4,4,0,0))
+for(i in 1:7){
+  plot(pred[, i], rsd[, i], pch = 21, 
+    main = colnames(rsd)[i], xlab = "Fitted values", ylab = "Residuals", 
+    cex = 0.75, lwd = 0.5)
+  abline(h = 0, lty = 2)
+}
+mtext(text=c("Fitted values on the simplex","Residuals on the simplex"), side=c(1,2),at=0.5,line=2,outer=TRUE)
+par(opar)
+#dev.off()
+```
+
+#### Simplex
+
+```{r}
+pred <- compositions::alrInv(pred)
+colnames(pred) <- names_y
+rsd <- compositions::alrInv(rsd)
+colnames(rsd) <- names_y
+
+opar <- par(mfrow=c(2, 4),mar=c(2,2,1,1), oma=c(4,4,0,0))
+for(i in 1:8){
+  plot(pred[, i], rsd[, i], pch = 21, 
+    main = colnames(rsd)[i], xlab = "Fitted values on the simplex", ylab = "Residuals on the simplex", 
+    cex = 0.75, lwd = 0.5)
+  abline(h = 0, lty = 2)
+}
+mtext(text=c("Fitted values on the simplex","Residuals on the simplex"), side=c(1,2),at=0.5,line=2,outer=TRUE)
+par(opar)
+```
+
+# Compare models
+
+```{r}
+model_list <- list(modelI, modelII, modelIII, modelIV, modelV, modelVI, modelVII)
+names(model_list) <- paste0("model", 1:length(model_list))
+
+measures <- lapply(model_list, function(mod){
+  xx <- inla.posterior.sample(1000, mod, seed = inla.seed)
+  inf <- parallel::mclapply(xx, INLAcomp::extract_lp_sigma)
+  
+  # DIC
+  dic_mod <- INLAcomp::dic.mult(inf, y = data[, names_alry])
+  
+  #WAIc
+  waic_mod <- INLAcomp::waic.mult(inf, y = data[, names_alry])
+  
+  #lIST FOR cpo
+  friends_list <- 1:(N*(D-1)) %>%
+  lapply(., function(x){
+    c(seq(x, N*(D-1), by = N)[-1],
+      rev(seq(x, 1, by = -N))) -> res
+    res[order(res)]
+  })
+    
+    
+  a4 <- INLA::inla.group.cv(result = mod,
+                          num.level.sets = -1,
+                          strategy = "posterior",
+                          friends = friends_list,
+                          verbose = FALSE)
+
+  LCPO <- a4$cv %>% log(.) %>% mean(.) %>% -.
+  
+  data.frame(DIC = dic_mod, WAIC = waic_mod, LCPO = LCPO)
+})
+
+measures <-  as.data.frame(do.call(rbind, measures))
+
+measures[, c("DIC.dic", "WAIC.waic", "LCPO")]
+```
+
+# RW1 and AR(1) overfitting
+
+```{r}
+# Fitted values
+pred <- modelIV$summary.fitted.values$mean[1:(N*(D-1))] %>% 
+  matrix(., ncol = D - 1, byrow = FALSE)
+pred <- compositions::alrInv(pred)
+colnames(pred) <- names_y
+```
+```{r, echo = FALSE}
+observed <- single_lme[, c(func_grp_lvls, "year")] %>% 
+  pivot_longer(!year, values_to = "comp", names_to = "functional_group")
+
+fitted_rw1 <- data.frame(pred) %>%
+  mutate(year = single_lme$year) %>% 
+  pivot_longer(!year, values_to = "comp", names_to = "functional_group")
+
+ggplot() +
+  geom_line(data = fitted_rw1, aes(y = comp, x = year, color = functional_group)) +
+  geom_point(data = observed, aes(y = comp, x = year, color = functional_group)) +
+  facet_wrap(~ functional_group, scales = "free") +
+  theme_classic()
+```
+
+# RW2 smoother solution
+
+```{r}
+# Fitted values
+pred <- modelVII$summary.fitted.values$mean[1:(N*(D-1))] %>% 
+  matrix(., ncol = D - 1, byrow = FALSE)
+pred <- compositions::alrInv(pred)
+colnames(pred) <- names_y
+```
+```{r, echo = FALSE}
+observed <- single_lme[, c(func_grp_lvls, "year")] %>% 
+  pivot_longer(!year, values_to = "comp", names_to = "functional_group")
+
+fitted_rw2 <- data.frame(pred) %>%
+  mutate(year = single_lme$year) %>% 
+  pivot_longer(!year, values_to = "comp", names_to = "functional_group")
+
+ggplot() +
+  geom_line(data = fitted_rw2, aes(y = comp, x = year, color = functional_group)) +
+  geom_point(data = observed, aes(y = comp, x = year, color = functional_group)) +
+  facet_wrap(~ functional_group, scales = "free") +
+  theme_classic()
+```
+
+```{r}
+fitted_rw1$model <- "RW1"
+fitted_rw2$model <- "RW2"
+fitted <- rbind(fitted_rw1, fitted_rw2)
+
+p <- ggplot() +
+  geom_point(data = observed, aes(y = comp, x = year), color = "#e6af2e", size = 0.4) +
+  geom_line(data = fitted, aes(y = comp, x = year, color = model), linewidth = 0.4) +
+  scale_color_manual(values = c("RW1" = "#f87060", "RW2" = "#102542")) +
+  facet_wrap(~ factor(functional_group, levels = func_grp_lvls), scales = "free", 
+             labeller = label_parsed) +
+  xlab("Year") +
+  ylab("Composition") +
+  theme_classic()
+
+#ggsave(filename = "img/scotian_shelf_rw1_rw2_fit.pdf", p, height = 4, width = 8)
+print(p)
+```
+
+
+```{r}
+pred <- modelVII$summary.fitted.values$mean[1:(N*(D-1))] %>% 
+  matrix(., ncol = D - 1, byrow = FALSE)
+colnames(pred) <- names_alry
+
+q25 <- modelVII$summary.fitted.values$`0.025quant`[1:(N*(D-1))] %>% 
+  matrix(., ncol = D - 1, byrow = FALSE)
+colnames(q25) <- names_alry
+q975 <- modelVII$summary.fitted.values$`0.975quant`[1:(N*(D-1))] %>% 
+  matrix(., ncol = D - 1, byrow = FALSE)
+colnames(q975) <- names_alry
+
+fitted_rw2 <- data.frame(pred) %>%
+  mutate(year = single_lme$year) %>% 
+  pivot_longer(!year, values_to = "comp", names_to = "functional_group")
+
+q25 <- data.frame(q25) %>%
+  mutate(year = single_lme$year) %>% 
+  pivot_longer(!year, values_to = "q25", names_to = "functional_group")
+
+q975 <- data.frame(q975) %>%
+  mutate(year = single_lme$year) %>% 
+  pivot_longer(!year, values_to = "q975", names_to = "functional_group")
+q <- full_join(q25, q975, by = c("year", "functional_group"))
+
+observed <- data %>% 
+  pivot_longer(!time, values_to = "comp", names_to = "functional_group")
+
+ggplot() +
+  geom_ribbon(data = q, aes(x = year, ymin = q25, ymax = q975), fill = "#8d99ae", alpha = 0.5) +
+  geom_line(data = fitted_rw2, aes(y = comp, x = year, color = functional_group)) +
+  geom_point(data = observed, aes(y = comp, x = (time + 1949), color = functional_group)) +
+  facet_wrap(~ functional_group, scales = "free") +
+  theme_classic()
+```
+
+### Fixed effects
+
+```{r}
+beta0 <- lapply(1:(D-1), function(i) inla.smarginal(modelVII$marginals.random$id_intercept[[i]]))
+names(beta0) <- as.character(1:7)
+
+beta0_df <- lapply(1:length(beta0),
+                   function(i){
+                     cbind(data.frame(beta0[[i]]), name1 = names(beta0)[i])
+                   })  %>%
+  do.call(rbind.data.frame, .)
+
+p <- ggplot() +
+  geom_line(data = beta0_df, aes(x = x, y = y), size = 1) +
+  theme_classic() +
+  theme(legend.position = "bottom") +
+  facet_wrap(~ name1, nrow = 2, scales = "free",
+               labeller = label_bquote(beta [0] ^ .(name1))) +
+  xlab(expression(beta[0]^(d))) +
+  ylab(expression(p(beta[0]^(d) *'|'* theta))) +
+  theme(legend.title = element_blank(),
+        axis.text = element_text(size = 7))
+
+#ggsave("img/scotian_shelf_posterior_intercept.pdf", p, height = 4, width = 7)
+print(p)
+```
+
+### Hyperparameters
+
+```{r}
+prec <- modelVII$marginals.hyperpar[1:(D-1)] %>%
+  c(., list(modelVII$marginals.hyperpar$`Precision for id_z`), list(modelVII$marginals.hyperpar$`Precision for i`))
+
+hyper <- lapply(1:length(prec),
+                function(x){
+                  inla.smarginal(inla.tmarginal(prec[[x]], fun = function(y)(1/y))) %>%
+                    data.frame(.)
+                })
+names(hyper) <- c(paste0("sigma2.", 1:(D-1)), "gamma", "sigma_u")
+
+hyper.df <- lapply(1:length(hyper),
+                   function(x){
+                     cbind(data.frame(hyper[[x]]), name1 = names(hyper)[x])
+                   })  %>%
+  do.call(rbind.data.frame, .)
+
+
+hyper.df$name1 <- ordered(hyper.df$name1,
+                          levels = c("sigma2.1", "sigma2.2", "sigma2.3", "sigma2.4", "sigma2.5", "sigma2.6", "sigma2.7",
+                                     "gamma", "sigma_u"),
+                          labels = c("sigma[1]^2", "sigma[2]^2", "sigma[3]^2", "sigma[4]^2", "sigma[5]^2", "sigma[6]^2", "sigma[7]^2", "gamma", "sigma[u]^2"))
+
+p <- ggplot(hyper.df) +
+  geom_line(aes(x = x, y = y), size = 1) +
+  facet_wrap(~ name1, scales = "free", 
+             labeller = label_parsed) +
+  theme_classic() +
+  xlab(expression(theta)) +
+  ylab(expression(p(theta*'|'*y)))
+
+#ggsave("img/scotian_shelf_posterior_hyperparam.pdf", p, height = 4, width = 7)
+print(p)
+```
+
+
+

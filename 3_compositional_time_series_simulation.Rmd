@@ -1,0 +1,451 @@
+---
+title: "Fitting compositional time series using logistic-normal distribution with Dirichlet covariance in R-INLA"
+subtitle: "Simulation of autoregressive model of order 1"
+date: "`r Sys.Date()`"
+author: Jorge Mestre Tomás
+output:
+  html_document:
+    toc: true
+    number_sections: true
+    toc_float: false
+    code_folding: show
+    theme: united
+    highlight: tango
+    fig_caption: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Load packages
+
+```{r}
+library(INLA)
+library(INLAcomp)
+library(compositions)
+library(MASS)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+```
+
+# Simulation {.tabset .tabset-fade}
+
+## Define parameters and dimensionality of the response
+
+Let $\mathbf{Y}_t$ be a compositional response variable with $D = 3$ categories, measured repeatedly over time $t = 1, \ldots, T$. We assume $\mathbf{Y} \in \mathbb{S}^D$ follows a logistic-normal distribution with Dirichlet covariance, denoted as $LND(\boldsymbol{\mu}, \boldsymbol{\Sigma})$. This implies that $\text{alr}(\mathbf{Y}) \sim N(\boldsymbol{\mu}, \boldsymbol{\Sigma})$, where:
+$$
+\Sigma_{dd} = \sigma^2_d + \gamma, d = 1, ..., D - 1, \\
+\Sigma_{dd^*} = \gamma, d \neq d^*,
+$$
+where $\sigma^2_d + \gamma$ represents the variance of each log-ratio, and $\gamma$ is the covariance between the log-ratios.
+
+We model the mean of the distribution as a function of a trend over time using an autoregressive model of order 1:
+
+$$ 
+alr(\mathbf{Y}) \sim ND((\boldsymbol{\mu}^{(1)}, \boldsymbol{\mu}^{(2)})), \boldsymbol{\Sigma}), \\
+\boldsymbol{\mu}_t^{(d)} = \beta_0^{(d)} + \text{trend}^{(d)}_t, \\
+\text{trend}^{(d)}_1 = u_t, \\
+\text{trend}^{(d)}_t = \rho^{(d)}\text{trend}^{(d)}_{t-1} + u_t, \\
+u_t \sim N(0, \sigma^2_u),
+$$
+where  $\boldsymbol{\mu}^{(d)} = (\mu_1^{(d)}, \ldots, \mu_T^{(d)})$ for $d = 1, \ldots, D-1$, are the linear predictors for the observation at time $t$ and the $d$-th alr-coordinate. $\beta_0^{(d)}$ is the intercept of the $d$-th alr-coordinate, $\rho^{(d)}$ is the temporal correlation term, and $u_t$ is the noise of the trend.
+
+Alternatively, the model can be expressed as:
+$$
+\begin{align}
+alr(\mathbf{Y})  & = \begin{bmatrix} \beta_0^{(1)} \\ \beta_0^{(2)} \end{bmatrix} + trend_t + \varepsilon_t,\\
+trend_1 & = u_t , \\
+trend_t & = \begin{bmatrix} \rho_{11} & \rho_{12} \\ \rho_{21} & \rho_{22} \end{bmatrix} trend_{t-1} + u_t \\
+u_t & \sim N(0, \sigma^2_u), \\
+\varepsilon_t &\sim N\left(0, \begin{bmatrix} \sigma^2_1 + \gamma & \gamma \\ \gamma & \sigma^2_2 + \gamma \end{bmatrix} \right).
+\end{align}
+$$
+We assume the two series are contemporaneously correlated ($\gamma > 0$) and correlated over time for lag $k = 1$ ($\rho_{11} = \rho_{22} > 0$), but they are not cross-lag correlated ($\rho_{12} = \rho_{21} = 0$).
+
+```{r}
+n <- 200 # number of observations
+D <- 3 # number of components
+
+# Parameters for the simulation
+intercept <- c(-0.05, 0.1) # intercept or mean for start-up value
+sigma2_e <- c(0.01, 0.005) # sd2 for gaussian error term
+gamma <- 0.005 # covariance parameter for components
+sigma_diag <- sqrt(sigma2_e + gamma)
+
+# We create the correlation parameters for components based on the previous idea
+corr <- diag(1/sigma_diag) %*% matrix(gamma, D-1, D-1) %*% diag(1/sigma_diag)
+diag(corr) <- 1
+
+# Temporal trend
+sigma2_u <- 0.001 # sd2 for error term in trend
+rho <- 0.9 # rho for AR model
+
+set.seed(2345)
+inla.seed <- sample.int(n=1E6, size = 0.5)
+```
+
+## Simulate Gaussian error
+
+```{r}
+Sigma <- matrix(sigma_diag, ncol = 1) %*% matrix(sigma_diag, nrow = 1)
+Sigma <- Sigma*corr
+Sigma
+
+# Pure noise e (Gaussian error)
+e <- MASS::mvrnorm(
+  n = n,
+  mu = rep(0, D-1),
+  Sigma = Sigma
+)
+```
+
+## Simulate temporal trend
+
+```{r}
+# Approach 1
+# Simulate pure noise of trend u
+u <- lapply(1:(D-1), function(i){rnorm(n, sd = sqrt(sigma2_u))}) %>%
+  do.call(cbind, .)
+
+# Trend in time t as trend from last year + pure noise u_t
+trend <- lapply(1:(D-1), function(i){rep(0, n)}) %>% 
+  do.call(cbind, .)
+trend[1, ] <- u[1, ]
+for (i in 2:n){
+  trend[i, ] <- rho*trend[i-1, ] + u[i, ]
+}
+
+## Approach 2
+#trend <- lapply(1:(D-1), function(i){
+#  as.vector(arima.sim(list(order = c(1,0,0), ar = rho), n = n, sd=sqrt(sigma2_u)))
+#})
+#trend <- do.call(cbind, trend)
+```
+
+## Get $alr$-coordinates
+
+```{r}
+# Get $alr$-coordinates by adding intercept and Guassian error.
+alr_y <- lapply(1:(D-1), function(i){rep(0, n)}) %>% 
+  do.call(cbind, .)
+for (i in 1:n){
+  alr_y[i, ] <- intercept + trend[i, ] + e[i, ] # noise around trend
+}
+colnames(alr_y) <- paste0("alr_y", 1:(D-1))
+```
+
+## Data in the simplex
+
+Move data to the Simplex.
+
+```{r}
+y_simplex <- compositions::alrInv(alr_y) %>% 
+  as.data.frame()
+colnames(y_simplex) <- paste0("y", 1:D)
+
+data <- cbind(y_simplex, alr_y)
+data$time <- 1:nrow(data)
+```
+
+# Visualize simulated data
+
+```{r, echo = FALSE}
+trend_gg <- mapply("+",as.data.frame(trend),intercept) %>% 
+  as.data.frame() %>% 
+  rename(c("Trend1" = "V1", "Trend2" = "V2")) %>% 
+  mutate(time = 1:nrow(trend)) %>% 
+  pivot_longer(!time, names_to = "names", values_to = "alr_y")
+alry_gg <- as.data.frame(alr_y) %>% 
+  mutate(time = 1:nrow(alr_y)) %>% 
+  pivot_longer(!time, names_to = "names", values_to = "alr_y")
+
+p1 <- ggplot() +
+  geom_line(data = alry_gg, aes(x = time, y = alr_y, color = names),linetype = "dashed", size = 0.5) +
+  geom_line(data = trend_gg, aes(x = time, y = alr_y, color = names), size = 0.5) +
+  scale_color_manual(values = c("alr_y1" = "#4FA3AB", "alr_y2" = "#dac484", "Trend1" = "#3d405b", "Trend2" = "#e07a5f"), name = "") +
+  theme_classic() +
+  xlab("Time") +
+  ylab(substitute(paste(italic('alr'), '-coordinates'))) +
+  ggtitle("a") +
+  theme(legend.position = "bottom",
+        plot.title = element_text(face = "bold"))
+
+p2 <- pivot_longer(data, c(y1, y2, y3),names_to = "y_names", values_to = "y_resp") %>%
+  ggplot(data = ., aes(x = time, y = y_resp, color = y_names)) +
+  geom_line(size = 0.5) +
+  scale_color_manual(values = c("y1" = "#F6733A", "y2" = "#4FA3AB", "y3" = "#d1495b"), name = "") +
+  theme_classic() +
+  xlab("Time") +
+  ylab("Composition") +
+  ggtitle("b") +
+  theme(legend.position = "bottom",
+        plot.title = element_text(face = "bold"))
+
+p <- ggpubr::ggarrange(p1, p2)
+#ggsave("simualted_cts.pdf", p, height = 4, width = 7)
+print(p)
+```
+
+# Data preparation {.tabset .tabset-fade}
+
+Prepare data for inference with R-INLA
+
+```{r}
+y <- data[,paste0("y", 1:D)]
+data <- alr(y) %>% as.data.frame()
+
+D <- ncol(y)
+N <- nrow(y)
+names_y <- colnames(y)
+names_alry <- colnames(data)
+```
+
+## Extending the dataset
+
+Extend the dataset of the $alr$-coordinates to fit in the `inla.stack`.
+
+```{r}
+data_ext <- data %>%
+  tidyr::pivot_longer(., cols = names_alry,
+                      names_to = "alr_names",
+                      values_to = "alr_resp") %>%
+  .[order(ordered(.$alr_names)),]
+data_ext$alr_names <- ordered(data_ext$alr_names)
+head(data_ext)
+```
+
+## Index for the temporal effects
+
+```{r}
+iset <- inla.spde.make.index('i', n.spde = nrow(data),
+                             n.repl  = D-1) #Replicating temporal effect
+```
+
+## Define the part to the shared random effect
+
+```{r}
+# Index for the random effect that is going to give the correlation
+id_z <- rep(1:(dim(data_ext)[1]/(D-1)), D-1)
+
+# Index for indicating the alr-coordinate
+id_cat <- rep(1:(D-1), rep(N, D-1))
+```
+
+## Fixed effects
+
+Covariates are included in the model as random effects with big variances. Here we are going to include the intercept.
+
+```{r}
+variables <- c("intercept")
+id_names <- paste0("id_", variables)
+id_variables <- rep(id_cat, length(variables)) %>% 
+  matrix(., ncol = length(variables), byrow = FALSE)
+colnames(id_variables) <- id_names
+```
+
+## Response variable in R-INLA
+
+Matrix with dimmension $(N \times (D-1)) \times (D - 1)$ for including the multivariate response in R-INLA.
+
+```{r}
+1:length(names_alry) %>%
+  lapply(., function(i){
+    data_ext %>%
+      dplyr::filter(alr_names == names_alry[i]) -> data_comp_i
+    #Response
+    y_alr <- matrix(ncol = names_alry %>% length(.), nrow = dim(data_comp_i)[1])
+    y_alr[, i] <- data_comp_i$alr_resp
+  }) -> alr_resp
+
+1:length(names_alry) %>%
+  lapply(., function(i){
+    y_aux <- data_ext %>%
+      dplyr::select(alr_resp, alr_names) %>%
+      dplyr::filter(alr_names == names_alry[i]) %>%
+      dplyr::select(alr_resp) %>%
+      as.matrix(.)
+    aux_vec <- rep(NA, (D-1))
+    aux_vec[i] <- 1
+    kronecker(aux_vec, y_aux)
+  }) -> y_list
+
+y_alr <- do.call(cbind, y_list)
+```
+
+## INLA stack for estimation
+
+```{r}
+stk_est <- inla.stack(
+  data    = list(resp = y_alr),
+  A       = list(1, 1),
+  effects = list(c(iset),
+                 data.frame(id_z,
+                            id_variables, 
+                            intercept = 1)
+  ),
+  tag     = 'est'
+)
+```
+
+# Model {.tabset .tabset-fade}
+
+The before definition of LND model allows to make estimates with independent Gaussian distributions ($z_d$ to be an independent Gaussian random variable with different mean $\mu-d$ and variances $\sigma^2_d$) and a shared random effect between predictors $u \sim N(0, \gamma)$, defined as:
+
+$$
+y_1 = z_1 + u, \\
+y_2 = z_2 + u \\
+... \\
+y_{D-1} = z_{D-1} + u.
+$$
+
+## Fitting the model
+
+Have different parameters for fixed effects, and different realizations of the temporal effect for each linear predictor
+
+```{r}
+list_prior <- rep(list(list(prior = "pc.prec", param = c(1, 0.01))), D-1)
+
+formula_model <- resp ~ -1 +
+  f(id_intercept, intercept,
+    model = "iid",
+    initial = log(1/1000),
+    fixed = TRUE) +
+  f(i,
+    model = "ar1",
+    replicate = i.repl) +
+  f(id_z,
+    model = "iid",
+    hyper = list(prec = list(prior = "pc.prec",
+                             param = c(1, 0.01))), constr = TRUE)
+
+model <- inla(
+  formula_model,
+  family = rep("gaussian", D - 1),
+  data = inla.stack.data(stk_est),
+  control.compute = list(config = TRUE),
+  control.predictor = list(A = inla.stack.A(stk_est), 
+                           compute = TRUE),
+  control.family = list_prior,   
+  verbose = FALSE
+)
+```
+
+## Posterior distributions {.tabset .tabset-fade}
+
+### Temporal effect
+
+```{r}
+model <- model
+temporal_median <- matrix(model$summary.random$i$'0.5quant', byrow = FALSE, ncol = D -1)
+temporal_025 <- matrix(model$summary.random$i$'0.025quant', byrow = FALSE, ncol = D -1)
+temporal_975 <- matrix(model$summary.random$i$'0.975quant', byrow = FALSE, ncol = D -1)
+
+p1 <- ggplot() +
+    geom_ribbon(data = data.frame(x = 1:n, q25 = temporal_025[, 1], q975 = temporal_975[, 1]), aes(x = x, ymin = q25, ymax = q975), fill = "#4FA3AB", alpha = 0.3) +
+  geom_line(data = data.frame(x = 1:n, y = temporal_median[, 1]), aes(x = x, y = y), color = "#3d405b", size = 0.5) +
+    geom_line(data = data.frame(x = 1:n, y = trend[, 1]), aes(x = x, y = y), color = "red4", size = 0.5, linetype = "dashed") +
+    ylab(expression("alr(y"[1]*")")) +
+    xlab("Time") +
+    ggtitle("a") +
+    theme_classic() +
+    theme(plot.title = element_text(face = "bold"))
+
+p2 <- ggplot() +
+    geom_ribbon(data = data.frame(x = 1:n, q25 = temporal_025[, 2], q975 = temporal_975[, 2]), aes(x = x, ymin = q25, ymax = q975), fill = "#dac484", alpha = 0.3) +
+  geom_line(data = data.frame(x = 1:n, y = temporal_median[, 2]), aes(x = x, y = y), color = "#e07a5f", size = 0.5) +
+    geom_line(data = data.frame(x = 1:n, y = trend[, 2]), aes(x = x, y = y), color = "red4", size = 0.5, linetype = "dashed") +
+    ylab(expression("alr(y"[2]*")")) +
+    xlab("Time") +
+    ggtitle("b") +
+    theme_classic() +
+    theme(plot.title = element_text(face = "bold"))
+
+p <- ggpubr::ggarrange(p1, p2)
+#ggsave("estimated_temporal_trend_sim.pdf", p, height = 4, width = 7)
+print(p)
+```
+
+### Fixed effects
+
+```{r}
+beta0 <- lapply(1:(D-1), function(i) inla.smarginal(model$marginals.random$id_intercept[[i]]))
+names(beta0) <- c("1", "2")
+
+beta0_df <- lapply(1:length(beta0),
+                   function(i){
+                     cbind(data.frame(beta0[[i]]), name1 = names(beta0)[i])
+                   })  %>%
+  do.call(rbind.data.frame, .)
+
+beta0_real <- data.frame(real = intercept,
+                         name1 = c("1", "2"))
+
+p <- ggplot() +
+  geom_line(data = beta0_df, aes(x = x, y = y), size = 1) +
+  geom_vline(data = beta0_real, aes(xintercept = real), col = "red4", size = 1) +
+  theme_classic() +
+  theme(legend.position = "bottom") +
+  facet_wrap(~ name1, nrow = 1, scales = "free",
+               labeller = label_bquote(beta [0] ^ .(name1))) +
+  xlab(expression(beta[0]^(d))) +
+  ylab(expression(p(beta[0]^(d) *'|'* theta))) +
+  theme(legend.title = element_blank())
+
+#ggsave("estimated_intercept_sim.pdf", p, height = 4, width = 7)
+print(p)
+```
+
+### Hyperparameters
+
+```{r}
+prec <- model$marginals.hyperpar[1:(D-1)] %>%
+  c(., list(model$marginals.hyperpar$`Precision for id_z`), list(model$marginals.hyperpar$`Precision for i`))
+
+hyper <- lapply(1:length(prec),
+                function(x){
+                  inla.smarginal(inla.tmarginal(prec[[x]], fun = function(y)(1/y))) %>%
+                    data.frame(.)
+                })
+names(hyper) <- c(paste0("sigma2.", 1:(D-1)), "gamma", "sigma_u")
+hyper <- c(hyper, rho = list(inla.smarginal(model$marginals.hyperpar$`Rho for i`)))
+
+hyper.df <- lapply(1:length(hyper),
+                   function(x){
+                     cbind(data.frame(hyper[[x]]), name1 = names(hyper)[x])
+                   })  %>%
+  do.call(rbind.data.frame, .)
+
+
+hyper.df$name1 <- ordered(hyper.df$name1,
+                          levels = c("sigma2.1", "sigma2.2",
+                                     "gamma", "rho", "sigma_u"),
+                          labels = c("sigma[1]^2", "sigma[2]^2", "gamma", "rho", "sigma[u]^2"))
+
+
+hyper.real <- data.frame(real = c(sigma2_e, gamma, rho, sigma2_u),
+                         name1 = c(paste0("sigma2.", 1:(D-1)),
+                                   "gamma", "rho", "sigma_u"))
+
+hyper.real$name1 <- as.factor(hyper.real$name1)
+hyper.real$name1 <- ordered(hyper.real$name1,
+                            levels = c("sigma2.1", "sigma2.2",
+                                       "gamma", "rho", "sigma_u"),
+                            labels = c("sigma[1]^2", "sigma[2]^2", "gamma", "rho", "sigma[u]^2"))
+
+
+
+p <- ggplot(hyper.df) +
+  geom_line(aes(x = x, y = y), size = 1) +
+  geom_vline(data = hyper.real, aes(xintercept = real), col = "red4", size = 1) +
+  facet_wrap(~ name1, scales = "free", 
+             labeller = label_parsed) +
+  theme_classic() +
+  xlab(expression(theta)) +
+  ylab(expression(p(theta*'|'*y)))
+
+#ggsave("estimated_hyperparams_sim.pdf", p, height = 4, width = 7)
+print(p)
+```
