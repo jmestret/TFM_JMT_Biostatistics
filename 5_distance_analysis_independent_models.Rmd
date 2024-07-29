@@ -194,8 +194,6 @@ for (i in unique(lme_no_zero$area_id)){
   stk_est <- coda_inla_stack(alry, k, N)
   
   # Fit model
-  list_prior <- rep(list(list(prior = "pc.prec", param = c(1, 0.01))), D-1)
-  
   formula_model <- resp ~ -1 +
     f(id_intercept, intercept,
       model = "iid",
@@ -206,8 +204,7 @@ for (i in unique(lme_no_zero$area_id)){
       replicate = i.repl) +
     f(id_z,
       model = "iid",
-      hyper = list(prec = list(prior = "pc.prec",
-                               param = c(1, 0.01))), constr = TRUE)
+      constr = TRUE)
   
   model <- inla(
     formula_model,
@@ -219,7 +216,6 @@ for (i in unique(lme_no_zero$area_id)){
                            cpo = TRUE),
     control.predictor = list(A = inla.stack.A(stk_est), 
                              compute = TRUE),
-    control.family = list_prior,   
     verbose = FALSE
   )
   

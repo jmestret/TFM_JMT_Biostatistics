@@ -306,8 +306,6 @@ $$
 Have different parameters for fixed effects, and different realizations of the temporal effect for each linear predictor
 
 ```{r}
-list_prior <- rep(list(list(prior = "pc.prec", param = c(1, 0.01))), D-1)
-
 formula_model <- resp ~ -1 +
   f(id_intercept, intercept,
     model = "iid",
@@ -318,8 +316,7 @@ formula_model <- resp ~ -1 +
     replicate = i.repl) +
   f(id_z,
     model = "iid",
-    hyper = list(prec = list(prior = "pc.prec",
-                             param = c(1, 0.01))), constr = TRUE)
+    constr = TRUE)
 
 model <- inla(
   formula_model,
@@ -328,7 +325,6 @@ model <- inla(
   control.compute = list(config = TRUE),
   control.predictor = list(A = inla.stack.A(stk_est), 
                            compute = TRUE),
-  control.family = list_prior,   
   verbose = FALSE
 )
 ```

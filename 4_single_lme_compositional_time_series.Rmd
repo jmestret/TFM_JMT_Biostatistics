@@ -252,15 +252,12 @@ stk_est <- inla.stack(
 Common parameters for the different categories and time as covariate.
 
 ```{r}
-list_prior <- rep(list(list(prior = "pc.prec", param = c(1, 0.01))), D-1)
-
 formula_modelI <- resp ~ -1 +
   intercept +
   time +
   f(id_z,
     model = "iid",
-    hyper = list(prec = list(prior = "pc.prec",
-                             param = c(1, 0.01))), constr = TRUE)
+    constr = TRUE)
 
 modelI <- inla(
   formula_modelI,
@@ -272,7 +269,6 @@ modelI <- inla(
                          cpo = TRUE),
   control.predictor = list(A = inla.stack.A(stk_est), 
                            compute = TRUE),
-  control.family = list_prior,   
   verbose = FALSE
 )
 ```
@@ -385,8 +381,6 @@ par(opar)
 Different parameters for each category and time as covariate.
 
 ```{r}
-list_prior <- rep(list(list(prior = "pc.prec", param = c(1, 0.01))), D-1)
-
 formula_modelII <- resp ~ -1 +
   f(id_intercept, intercept,
     model = "iid",
@@ -398,8 +392,7 @@ formula_modelII <- resp ~ -1 +
     fixed = TRUE) +
   f(id_z,
     model = "iid",
-    hyper = list(prec = list(prior = "pc.prec",
-                             param = c(1, 0.01))), constr = TRUE)
+    constr = TRUE)
 
 modelII <- inla(
   formula_modelII,
@@ -411,7 +404,6 @@ modelII <- inla(
                          cpo = TRUE),
   control.predictor = list(A = inla.stack.A(stk_est), 
                            compute = TRUE),
-  control.family = list_prior,   
   verbose = FALSE
 )
 ```
@@ -548,8 +540,6 @@ par(opar)
 Different parameters for intercept and same temporal effect RW1.
 
 ```{r}
-list_prior <- rep(list(list(prior = "pc.prec", param = c(1, 0.01))), D-1)
-
 formula_modelIII <- resp ~ -1 +
   f(id_intercept, intercept,
     model = "iid",
@@ -570,8 +560,7 @@ formula_modelIII <- resp ~ -1 +
     fixed = TRUE) +
   f(id_z,
     model = "iid",
-    hyper = list(prec = list(prior = "pc.prec",
-                             param = c(1, 0.01))), constr = TRUE)
+    constr = TRUE)
 
 modelIII <- inla(
   formula_modelIII,
@@ -583,7 +572,6 @@ modelIII <- inla(
                          cpo = TRUE),
   control.predictor = list(A = inla.stack.A(stk_est), 
                            compute = TRUE),
-  control.family = list_prior,   
   verbose = FALSE
 )
 ```
@@ -637,8 +625,6 @@ par(opar)
 Different parameters for fixed effects, and different realizations of the temporal effect for each linear predictor RW1.
 
 ```{r}
-list_prior <- rep(list(list(prior = "pc.prec", param = c(1, 0.01))), D-1)
-
 formula_modelIV <- resp ~ -1 +
   f(id_intercept, intercept,
     model = "iid",
@@ -649,8 +635,7 @@ formula_modelIV <- resp ~ -1 +
     replicate = i.repl) +
   f(id_z,
     model = "iid",
-    hyper = list(prec = list(prior = "pc.prec",
-                             param = c(1, 0.01))), constr = TRUE)
+    constr = TRUE)
 
 modelIV <- inla(
   formula_modelIV,
@@ -662,7 +647,6 @@ modelIV <- inla(
                          cpo = TRUE),
   control.predictor = list(A = inla.stack.A(stk_est), 
                            compute = TRUE),
-  control.family = list_prior,   
   verbose = FALSE
 )
 ```
@@ -716,8 +700,6 @@ par(opar)
 Different parameters for intercept and same temporal effect AR(1).
 
 ```{r}
-list_prior <- rep(list(list(prior = "pc.prec", param = c(1, 0.01))), D-1)
-
 formula_modelV <- resp ~ -1 +
   f(id_intercept, intercept,
     model = "iid",
@@ -738,8 +720,7 @@ formula_modelV <- resp ~ -1 +
     fixed = TRUE) +
   f(id_z,
     model = "iid",
-    hyper = list(prec = list(prior = "pc.prec",
-                             param = c(1, 0.01))), constr = TRUE)
+    constr = TRUE)
 
 modelV <- inla(
   formula_modelV,
@@ -751,7 +732,6 @@ modelV <- inla(
                          cpo = TRUE),
   control.predictor = list(A = inla.stack.A(stk_est), 
                            compute = TRUE),
-  control.family = list_prior,   
   verbose = FALSE
 )
 ```
@@ -805,8 +785,6 @@ par(opar)
 Have different parameters for fixed effects, and different realizations of the temporal effect for each linear predictor AR(1).
 
 ```{r}
-list_prior <- rep(list(list(prior = "pc.prec", param = c(1, 0.01))), D-1)
-
 formula_modelVI <- resp ~ -1 +
   f(id_intercept, intercept,
     model = "iid",
@@ -817,8 +795,7 @@ formula_modelVI <- resp ~ -1 +
     replicate = i.repl) +
   f(id_z,
     model = "iid",
-    hyper = list(prec = list(prior = "pc.prec",
-                             param = c(1, 0.01))), constr = TRUE)
+    constr = TRUE)
 
 modelVI <- inla(
   formula_modelVI,
@@ -830,7 +807,6 @@ modelVI <- inla(
                          cpo = TRUE),
   control.predictor = list(A = inla.stack.A(stk_est), 
                            compute = TRUE),
-  control.family = list_prior,   
   verbose = FALSE
 )
 ```
@@ -884,8 +860,6 @@ par(opar)
 Have different parameters for fixed effects, and different realizations of the temporal effect for each linear predictor RW1.
 
 ```{r}
-list_prior <- rep(list(list(prior = "pc.prec", param = c(1, 0.01))), D-1)
-
 formula_modelVII <- resp ~ -1 +
   f(id_intercept, intercept,
     model = "iid",
@@ -896,8 +870,7 @@ formula_modelVII <- resp ~ -1 +
     replicate = i.repl) +
   f(id_z,
     model = "iid",
-    hyper = list(prec = list(prior = "pc.prec",
-                             param = c(1, 0.01))), constr = TRUE)
+    constr = TRUE)
 
 modelVII <- inla(
   formula_modelVII,
@@ -909,7 +882,6 @@ modelVII <- inla(
                          cpo = TRUE),
   control.predictor = list(A = inla.stack.A(stk_est), 
                            compute = TRUE),
-  control.family = list_prior,   
   verbose = FALSE
 )
 ```
@@ -934,7 +906,7 @@ for(i in 1:7){
     cex = 0.75, lwd = 0.5)
   abline(h = 0, lty = 2)
 }
-mtext(text=c("Fitted values on the simplex","Residuals on the simplex"), side=c(1,2),at=0.5,line=2,outer=TRUE)
+mtext(text=c("Fitted values","Residuals"), side=c(1,2),at=0.5,line=2,outer=TRUE)
 par(opar)
 #dev.off()
 ```
